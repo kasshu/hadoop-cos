@@ -38,7 +38,8 @@ public class CosNFSDirectInputStream extends FSInputStream{
     private final int socketErrMaxRetryTimes;
     // last read cache
     com.google.common.cache.Cache<Pair<Long, Long>, byte[]> page_cache;
-    static final int READ_CACHE_SIZE = 16 * 1024;
+    private static final long READ_CACHE_SIZE = 16 * Unit.KB;
+    private static final long READ_BASE = 128 * Unit.KB;
     private String clientId;
 
     private final ExecutorService readAheadExecutorService;
@@ -123,33 +124,58 @@ public class CosNFSDirectInputStream extends FSInputStream{
         return (ret <= 0) ? -1 : (oneByteBuff[0] & 0xff);
     }
 
-    @Override
-    public int read(byte[] b, int off, int len) throws IOException {
-        this.checkOpened();
-        //LOG.info("Begin to read object [{}], offset [{}], len [{}], pos [{}]", this.key, off, len, this.position);
-        long start = System.currentTimeMillis();
-        if (len == 0) {
+    private int readFromCache(byte[] b, int off, int len) {
+        // locate range in 16k cache
+        long byteStart = this.position;
+        long byteEnd = this.position + len - 1;
+        if (byteEnd >= this.fileSize) {
+            byteEnd = this.fileSize - 1;
+        }
+        Pair<Long, Long> range = Pair.<Long, Long>of(byteStart, byteEnd);
+        byte[] last_read_cache = this.page_cache.getIfPresent(range);
+
+        // cache miss
+        if(last_read_cache == null) {
             return 0;
+        } else {
+            assert len == last_read_cache.length;
+            // abandon old buffer because cache hit always means random read
+            this.buffer = last_read_cache;
         }
 
-        if (off < 0 || len < 0 || len > b.length) {
-            throw new IndexOutOfBoundsException();
+        // cache hit
+        LOG.info("ClientId: {}, manual page cache hit, key: {}, offset: {}, len: {}, range start: {}, range end: {}",
+                this.clientId, this.key, off, len, byteStart, byteEnd);
+        int bytesRead = 0;
+        for (int i = 0; i < this.buffer.length; i++) {
+            b[off + bytesRead] = this.buffer[i];
+            bytesRead++;
+            if (bytesRead >= len) {
+                break;
+            }
         }
 
-        long byteStart = this.position + off;
-        long byteEnd = this.position + off + len-1;
+        this.position += bytesRead;
+
+        return bytesRead;
+    }
+
+    private int readFromBuffer(byte[] b, int off, int len) throws IOException {
+        // locate range in read ahead cache
+        long byteStart = this.position;
+        long byteEnd = this.position + len - 1;
         if (byteEnd >= this.fileSize) {
             byteEnd = this.fileSize - 1;
         }
 
-        Pair<Long, Long> range = Pair.<Long, Long>of(byteStart, byteEnd);
-        byte[] last_read_cache = this.page_cache.getIfPresent(range);
-        if(null != last_read_cache) {
-            LOG.info("ClientId: {}, manual page cache hit, key: {}, offset: {}, len: {}, range start: {}, range end: {}",
-                    this.clientId, this.key, off, len, byteStart, byteEnd);
-            this.buffer = last_read_cache;
-        } else {
-            CosNFSInputStream.ReadBuffer readBuffer = new CosNFSInputStream.ReadBuffer(byteStart, byteEnd);
+        // read ahead cache miss, get data from cos
+        if(byteStart < bufferStart || byteEnd > bufferEnd) {
+            long readStart = byteStart;
+            long readEnd = this.position + Math.max(len, READ_BASE) - 1;
+            if (readEnd >= this.fileSize) {
+                readEnd = this.fileSize - 1;
+            }
+            CosNFSInputStream.ReadBuffer readBuffer = new CosNFSInputStream.ReadBuffer(readStart, readEnd);
             if (readBuffer.getBuffer().length == 0) {
                 readBuffer.setStatus(CosNFSInputStream.ReadBuffer.SUCCESS);
             } else {
@@ -174,6 +200,7 @@ public class CosNFSDirectInputStream extends FSInputStream{
                     this.bufferStart = -1;
                     this.bufferEnd = -1;
                 } else {
+                    // abandon old buffer because we need this one
                     this.buffer = readBuffer.getBuffer();
                     this.bufferStart = readBuffer.getStart();
                     this.bufferEnd = readBuffer.getEnd();
@@ -189,34 +216,61 @@ public class CosNFSDirectInputStream extends FSInputStream{
                 LOG.error(String.format("Null IO stream key:%s", this.key), innerException);
                 throw new IOException("Null IO stream.", innerException);
             }
-
-            if (len <= this.READ_CACHE_SIZE) {
-                this.page_cache.put(range, this.buffer);
-            }
+        } else {
+            LOG.info("ClientId: {}, read ahead cache hit, key: {}, offset: {}, len: {}, range start: {}, range end: {}",
+                    this.clientId, this.key, off, len, byteStart, byteEnd);
         }
 
         int bytesRead = 0;
-        while (position < fileSize && bytesRead < len) {
-            int bytes = 0;
-            for (int i = 0; i < this.buffer.length; i++) {
-                b[off + bytesRead] = this.buffer[i];
-                bytes++;
-                bytesRead++;
-                if (off + bytesRead >= len) {
-                    break;
-                }
-            }
-
-            if (bytes > 0) {
-                this.position += bytes;
+        for (int i = (int)(this.position - this.bufferStart); i < this.buffer.length; i++) {
+            b[off + bytesRead] = this.buffer[i];
+            bytesRead++;
+            if (bytesRead >= len) {
+                break;
             }
         }
 
-        this.buffer = null;
+        // cache every random read less than 16k
+        if (len <= this.READ_CACHE_SIZE && this.position == this.bufferStart) {
+            byte[] cache_data = new byte[bytesRead];
+            for (int i = 0; i < bytesRead; i++) {
+                cache_data[i] = b[off + i];
+            }
+            Pair<Long, Long> range = Pair.<Long, Long>of(byteStart, byteEnd);
+            this.page_cache.put(range, cache_data);
+        }
+
+        this.position += bytesRead;
+
+        return bytesRead;
+    }
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+        this.checkOpened();
+        //LOG.info("Begin to read object [{}], offset [{}], len [{}], pos [{}]", this.key, off, len, this.position);
+        long start = System.currentTimeMillis();
+        if (len == 0) {
+            return 0;
+        }
+
+        if (off < 0 || len < 0 || len > b.length) {
+            throw new IndexOutOfBoundsException();
+        }
+
+        int bytesRead = readFromCache(b, off, len);
+        if (bytesRead == 0) {
+            bytesRead = readFromBuffer(b, off, len);
+        }
+
         if (null != this.statistics && bytesRead > 0) {
             this.statistics.incrementBytesRead(bytesRead);
         }
         long costMs = (System.currentTimeMillis() - start);
+        long byteStart = this.position;
+        long byteEnd = this.position + len - 1;
+        if (byteEnd >= this.fileSize) {
+            byteEnd = this.fileSize - 1;
+        }
         LOG.info("ClientId: {}, read object: {}, offset: {}, len: {}, costMs: {}, range start: {}, range end: {}",
                 this.clientId, this.key, off, len, costMs, byteStart, byteEnd);
 

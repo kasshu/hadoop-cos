@@ -39,7 +39,10 @@ public class CosNFSDirectInputStream extends FSInputStream{
     // last read cache
     com.google.common.cache.Cache<Pair<Long, Long>, byte[]> page_cache;
     private static final long READ_CACHE_SIZE = 16 * Unit.KB;
-    private static final long READ_BASE = 128 * Unit.KB;
+    private static final long READ_AHEAD_BASE = 128 * Unit.KB;
+    private static final long READ_AHEAD_MAX = 4 * Unit.MB;
+    private long readAheadBonus = READ_AHEAD_BASE;
+    private long lastReadEnd = -1;
     private String clientId;
 
     private final ExecutorService readAheadExecutorService;
@@ -156,8 +159,14 @@ public class CosNFSDirectInputStream extends FSInputStream{
         }
 
         this.position += bytesRead;
+        this.lastReadEnd = this.position;
 
         return bytesRead;
+    }
+
+    private boolean shouldReadAhead(long byteStart, long byteEnd) {
+        // we could locate this read in cache if we read ahead using current bonus
+        return byteStart >= this.lastReadEnd && byteEnd <= this.lastReadEnd + this.readAheadBonus;
     }
 
     private int readFromBuffer(byte[] b, int off, int len) throws IOException {
@@ -170,8 +179,11 @@ public class CosNFSDirectInputStream extends FSInputStream{
 
         // read ahead cache miss, get data from cos
         if(byteStart < bufferStart || byteEnd > bufferEnd) {
+            if (!shouldReadAhead(byteStart, byteEnd)) {
+                this.readAheadBonus = READ_AHEAD_BASE;
+            }
             long readStart = byteStart;
-            long readEnd = this.position + Math.max(len, READ_BASE) - 1;
+            long readEnd = this.position + Math.max(len, this.readAheadBonus) - 1;
             if (readEnd >= this.fileSize) {
                 readEnd = this.fileSize - 1;
             }
@@ -217,8 +229,9 @@ public class CosNFSDirectInputStream extends FSInputStream{
                 throw new IOException("Null IO stream.", innerException);
             }
         } else {
-            LOG.info("ClientId: {}, read ahead cache hit, key: {}, offset: {}, len: {}, range start: {}, range end: {}",
-                    this.clientId, this.key, off, len, byteStart, byteEnd);
+            this.readAheadBonus = Math.min(this.readAheadBonus * 2, READ_AHEAD_MAX);
+            LOG.info("ClientId: {}, read ahead cache hit, key: {}, offset: {}, len: {}, range start: {}, range end: {}, bonus: {}",
+                    this.clientId, this.key, off, len, byteStart, byteEnd, this.readAheadBonus);
         }
 
         int bytesRead = 0;
@@ -231,16 +244,15 @@ public class CosNFSDirectInputStream extends FSInputStream{
         }
 
         // cache every random read less than 16k
-        if (len <= this.READ_CACHE_SIZE && this.position == this.bufferStart) {
+        if (len <= READ_CACHE_SIZE && this.position == this.bufferStart) {
             byte[] cache_data = new byte[bytesRead];
-            for (int i = 0; i < bytesRead; i++) {
-                cache_data[i] = b[off + i];
-            }
+            System.arraycopy(b, off, cache_data, 0, bytesRead);
             Pair<Long, Long> range = Pair.<Long, Long>of(byteStart, byteEnd);
             this.page_cache.put(range, cache_data);
         }
 
         this.position += bytesRead;
+        this.lastReadEnd = this.position;
 
         return bytesRead;
     }
@@ -265,12 +277,14 @@ public class CosNFSDirectInputStream extends FSInputStream{
         if (null != this.statistics && bytesRead > 0) {
             this.statistics.incrementBytesRead(bytesRead);
         }
+
         long costMs = (System.currentTimeMillis() - start);
-        long byteStart = this.position;
-        long byteEnd = this.position + len - 1;
+        long byteStart = this.position - bytesRead;
+        long byteEnd = this.position + len - 1 - bytesRead;
         if (byteEnd >= this.fileSize) {
             byteEnd = this.fileSize - 1;
         }
+
         LOG.info("ClientId: {}, read object: {}, offset: {}, len: {}, costMs: {}, range start: {}, range end: {}",
                 this.clientId, this.key, off, len, costMs, byteStart, byteEnd);
 

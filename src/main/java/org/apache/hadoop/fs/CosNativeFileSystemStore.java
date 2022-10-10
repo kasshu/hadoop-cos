@@ -58,20 +58,46 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
 public class CosNativeFileSystemStore implements NativeFileSystemStore {
     public static final Logger LOG =
             LoggerFactory.getLogger(CosNativeFileSystemStore.class);
+
+    public static class UploadLatencyStat { // in milliseconds
+        private static final int LATENCY_SLIDING_WINDOW_SIZE = 10;
+        private final Queue<Long> latencySlidingWindow;
+        private long latencySumInWindow = 0;
+        private final Lock lock = new ReentrantLock();
+
+        public UploadLatencyStat() {
+            this.latencySlidingWindow = new ArrayDeque<>(LATENCY_SLIDING_WINDOW_SIZE);
+        }
+
+        public void recordLatency(long latency_in_milliseconds) {
+            assert latency_in_milliseconds >= 0;
+            lock.lock();
+            if(this.latencySlidingWindow.size() >= LATENCY_SLIDING_WINDOW_SIZE) {
+                Long to_be_removed = this.latencySlidingWindow.poll();
+                this.latencySumInWindow -= to_be_removed;
+            }
+            this.latencySlidingWindow.offer(latency_in_milliseconds);
+            this.latencySumInWindow += latency_in_milliseconds;
+            lock.unlock();
+        }
+
+        public synchronized long getAvgLatency() {
+            lock.lock();
+            long ret = this.latencySumInWindow / this.latencySlidingWindow.size();
+            lock.unlock();
+            return ret;
+        }
+    };
 
     private static final String XATTR_PREFIX = "cosn-xattr-";
 
@@ -89,6 +115,11 @@ public class CosNativeFileSystemStore implements NativeFileSystemStore {
     private TencentCloudL5EndpointResolver l5EndpointResolver;
     private boolean useL5Id = false;
     private int l5UpdateMaxRetryTimes;
+
+    private UploadLatencyStat uploadLatencyStat;
+    public long getAvgUploadLatency() {
+        return this.uploadLatencyStat.getAvgLatency();
+    }
 
     private void initCOSClient(URI uri, Configuration conf) throws IOException {
         COSCredentialProviderList cosCredentialProviderList = CosNUtils.createCosCredentialsProviderSet(uri, conf);
@@ -452,9 +483,12 @@ public class CosNativeFileSystemStore implements NativeFileSystemStore {
         }
         this.setEncryptionMetadata(uploadPartRequest, objectMetadata);
 
+        long start = System.currentTimeMillis();
         try {
             UploadPartResult uploadPartResult =
                     (UploadPartResult) callCOSClientWithRetry(uploadPartRequest);
+            long end = System.currentTimeMillis();
+            uploadLatencyStat.recordLatency(end - start);
             return uploadPartResult.getPartETag();
         } catch (Exception e) {
             String errMsg = String.format("The current thread:%d, "

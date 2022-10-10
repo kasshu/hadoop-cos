@@ -54,6 +54,10 @@ public class CosNFileSystem extends FileSystem {
     private String group = "Unknown";
     private ExecutorService boundedIOThreadPool;
     private ExecutorService boundedCopyThreadPool;
+    private ThreadPoolExecutor boundedUploadThreadPool;
+    private Thread uploadThreadPoolMonitor;
+    private long upload_latency_upper_bound_milliseconds = -1;
+    private long upload_latency_lower_bound_milliseconds = -1;
     private String clientId;
     private com.google.common.cache.Cache<String, com.google.common.cache.Cache<Pair<Long, Long>, byte[]>> page_caches;
 
@@ -132,7 +136,7 @@ public class CosNFileSystem extends FileSystem {
         BufferPool.getInstance().initialize(getConf());
 
         // initialize the thread pool
-        int uploadThreadPoolSize = this.getConf().getInt(
+        final int uploadThreadPoolSize = this.getConf().getInt(
                 CosNConfigKeys.UPLOAD_THREAD_POOL_SIZE_KEY,
                 CosNConfigKeys.DEFAULT_UPLOAD_THREAD_POOL_SIZE
         );
@@ -198,6 +202,32 @@ public class CosNFileSystem extends FileSystem {
                 }
         );
 
+        this.boundedUploadThreadPool = new ThreadPoolExecutor(
+                uploadThreadPoolSize, uploadThreadPoolSize,
+                threadKeepAlive, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<Runnable>(uploadThreadPoolSize),
+                new ThreadFactoryBuilder().setNameFormat("cos-transfer-upload-%d").setDaemon(true).build(),
+                new RejectedExecutionHandler() {
+                    @Override
+                    public void rejectedExecution(Runnable r,
+                                                  ThreadPoolExecutor executor) {
+                        if (!executor.isShutdown()) {
+                            try {
+                                executor.getQueue().put(r);
+                            } catch (InterruptedException e) {
+                                LOG.error("put a task into the upload " +
+                                        "thread pool occurs an exception.", e);
+                                throw new RejectedExecutionException(
+                                        "Putting the upload task failed due to the interruption", e);
+                            }
+                        } else {
+                            LOG.error("The bounded upload thread pool has been shutdown.");
+                            throw new RejectedExecutionException("The bounded upload thread pool has been shutdown");
+                        }
+                    }
+                }
+        );
+
         int copyThreadPoolSize = this.getConf().getInt(
                 CosNConfigKeys.COPY_THREAD_POOL_SIZE_KEY,
                 CosNConfigKeys.DEFAULT_COPY_THREAD_POOL_SIZE
@@ -224,6 +254,45 @@ public class CosNFileSystem extends FileSystem {
                     }
                 }
         );
+
+        this.upload_latency_upper_bound_milliseconds = conf.getLong(
+                CosNConfigKeys.COSN_UPLOAD_LATENCY_UPPER_BOUND_MILLISECONDS,
+                CosNConfigKeys.DEFAULT_COSN_UPLOAD_LATENCY_UPPER_BOUND_MILLISECONDS);
+
+        this.upload_latency_lower_bound_milliseconds = conf.getLong(
+                CosNConfigKeys.COSN_UPLOAD_LATENCY_LOWER_BOUND_MILLISECONDS,
+                CosNConfigKeys.DEFAULT_COSN_UPLOAD_LATENCY_LOWER_BOUND_MILLISECONDS);
+
+        final int finalIoMaxTaskSize = ioMaxTaskSize;
+        uploadThreadPoolMonitor = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                if(nativeStore instanceof CosNativeFileSystemStore) {
+                    long avgLatency = ((CosNativeFileSystemStore)nativeStore).getAvgUploadLatency();
+                    int currentMaxPoolSize = boundedUploadThreadPool.getMaximumPoolSize();
+                    if(avgLatency < upload_latency_lower_bound_milliseconds) {
+                        if(currentMaxPoolSize + 1 <= finalIoMaxTaskSize) {
+                            int newMaxPoolSize = currentMaxPoolSize + 1;
+                            LOG.info("Avg upload latency: {} is smaller than lower bound: {}, will increase worker num from {} to {}",
+                                    avgLatency, upload_latency_lower_bound_milliseconds, currentMaxPoolSize, newMaxPoolSize);
+                            boundedUploadThreadPool.setMaximumPoolSize(newMaxPoolSize);
+                        }
+                    } else if(avgLatency > upload_latency_upper_bound_milliseconds) {
+                        if(currentMaxPoolSize / 2 >= uploadThreadPoolSize) {
+                            int newMaxPoolSize = currentMaxPoolSize / 2;
+                            LOG.info("Avg upload latency: {} is larger than upper bound: {}, will decrease worker num from {} to {}",
+                                    avgLatency, upload_latency_upper_bound_milliseconds, currentMaxPoolSize, newMaxPoolSize);
+                            boundedUploadThreadPool.setMaximumPoolSize(newMaxPoolSize);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     @Override
@@ -339,7 +408,7 @@ public class CosNFileSystem extends FileSystem {
         } else {
             return new FSDataOutputStream(
                     new CosNFSDataOutputStream(this.getConf(), nativeStore, key,
-                            this.boundedIOThreadPool), statistics);
+                            this.boundedUploadThreadPool), statistics);
         }
     }
 

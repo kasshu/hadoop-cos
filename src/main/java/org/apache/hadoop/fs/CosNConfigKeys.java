@@ -168,5 +168,10 @@ public class CosNConfigKeys extends CommonConfigurationKeys {
 
     public static final String COSN_LOG_IO_DETAIL = "fs.cosn.log.io.detail";
     public static final boolean DEFAULT_COSN_LOG_IO_DETAIL = true;
+
+    public static final String COSN_UPLOAD_LATENCY_UPPER_BOUND_MILLISECONDS = "fs.cosn.upload.latency.upper.bound.milliseconds";
+    public static final long DEFAULT_COSN_UPLOAD_LATENCY_UPPER_BOUND_MILLISECONDS = 100;
+    public static final String COSN_UPLOAD_LATENCY_LOWER_BOUND_MILLISECONDS = "fs.cosn.upload.latency.lower.bound.milliseconds";
+    public static final long DEFAULT_COSN_UPLOAD_LATENCY_LOWER_BOUND_MILLISECONDS = 30;
 }
 

@@ -165,5 +165,8 @@ public class CosNConfigKeys extends CommonConfigurationKeys {
 
     public static final String COSN_SOCKET_BUFFER_SIZE = "fs.cosn.socket.buffer.size";
     public static final long DEFAULT_COSN_SOCKET_BUFFER_SIZE = 8 * Unit.KB;
+
+    public static final String COSN_LOG_IO_DETAIL = "fs.cosn.log.io.detail";
+    public static final boolean DEFAULT_COSN_LOG_IO_DETAIL = true;
 }
 
